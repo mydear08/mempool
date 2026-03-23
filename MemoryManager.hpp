@@ -1,3 +1,4 @@
+#pragma once
 #include <memory_resource>
 #include <mutex>
 #include <condition_variable>
@@ -9,61 +10,72 @@ namespace Lab {
 
 class MemoryManager {
 public:
+    // 管理オブジェクトのアライメントを保証する構造体
+    struct alignas(std::max_align_t) ControlBlock {
+        std::pmr::monotonic_buffer_resource mono_res;
+        std::pmr::unsynchronized_pool_resource pool_res;
+        // 依存関係があるため、デフォルト構築後に再構築するわ
+        ControlBlock() : mono_res(), pool_res(&mono_res) {} 
+    };
+
     struct alignas(std::max_align_t) Header {
         size_t size;
     };
+
+    enum class Result { Success = 0, AlreadyInitialized, InvalidBuffer, AlignmentError, BufferSizeTooSmall };
 
     static MemoryManager& Instance() {
         static MemoryManager instance;
         return instance;
     }
 
-    enum class Result {
-        Success = 0,
-        AlreadyInitialized,
-        InvalidBuffer,
-        BufferSizeTooSmall
-    };
-
-    // 初期化：バッファ内に管理オブジェクトを直接構築
     Result Initialize(void* buffer, size_t size) {
         std::lock_guard<std::mutex> lock(m_syncMutex);
         if (m_initialized) return Result::AlreadyInitialized;
 
-        if (!buffer || size < (sizeof(std::pmr::monotonic_buffer_resource) + 
-                             sizeof(std::pmr::synchronized_pool_resource) + 1024)) {
-            return Result::BufferSizeTooSmall;
+        // アライメントチェック
+        if (!buffer || reinterpret_cast<uintptr_t>(buffer) % alignof(std::max_align_t) != 0) {
+            return Result::AlignmentError;
         }
 
-        uint8_t* rawBuf = static_cast<uint8_t*>(buffer);
-        
-        // 配置newでリソースを構築
-        m_mono_res = new (&rawBuf[0]) std::pmr::monotonic_buffer_resource(
-            &rawBuf[sizeof(std::pmr::monotonic_buffer_resource) + sizeof(std::pmr::synchronized_pool_resource)],
-            size - (sizeof(std::pmr::monotonic_buffer_resource) + sizeof(std::pmr::synchronized_pool_resource)),
-            std::pmr::null_memory_resource()
-        );
+        const size_t controlSize = sizeof(ControlBlock);
+        if (size <= controlSize + 1024) return Result::BufferSizeTooSmall;
 
-        m_pool_res = new (&rawBuf[sizeof(std::pmr::monotonic_buffer_resource)]) 
-            std::pmr::synchronized_pool_resource(m_mono_res);
+        uint8_t* base = static_cast<uint8_t*>(buffer);
+        void* dataArea = base + controlSize;
+        size_t dataSize = size - controlSize;
+
+        // 二段階構築による確実な生存期間管理
+        m_cb = new (base) ControlBlock();
+        new (&m_cb->mono_res) std::pmr::monotonic_buffer_resource(dataArea, dataSize, std::pmr::null_memory_resource());
+        new (&m_cb->pool_res) std::pmr::unsynchronized_pool_resource(&m_cb->mono_res);
 
         m_initialized = true;
         return Result::Success;
     }
 
-    // タイムアウト付き確保
-    void* Allocate(size_t size, int timeout_ms = 0) {
-        if (!m_initialized) return nullptr;
+    void Shutdown() {
+        std::lock_guard<std::mutex> lock(m_syncMutex);
+        if (m_initialized && m_cb) {
+            // LIFO順でのデストラクタ呼び出し
+            m_cb->pool_res.~unsynchronized_pool_resource();
+            m_cb->mono_res.~monotonic_buffer_resource();
+            m_cb->~ControlBlock();
+            m_cb = nullptr;
+            m_initialized = false;
+        }
+    }
 
+    void* Allocate(size_t size, int timeout_ms) {
+        if (!m_initialized) return nullptr;
         size_t totalSize = size + sizeof(Header);
         std::unique_lock<std::mutex> lock(m_syncMutex);
 
         auto attempt = [&]() -> void* {
             try {
-                void* raw = m_pool_res->allocate(totalSize, alignof(Header));
+                void* raw = m_cb->pool_res.allocate(totalSize, alignof(Header));
                 if (raw) {
-                    Header* h = static_cast<Header*>(raw);
-                    h->size = totalSize;
+                    static_cast<Header*>(raw)->size = totalSize;
                     return static_cast<char*>(raw) + sizeof(Header);
                 }
             } catch (const std::bad_alloc&) {}
@@ -73,36 +85,31 @@ public:
         void* ptr = attempt();
         if (ptr || timeout_ms == 0) return ptr;
 
-        // 指定時間、または条件が満たされるまで待機
-        if (timeout_ms < 0) {
-            m_cv.wait(lock, [&] { return (ptr = attempt()) != nullptr; });
-        } else {
-            m_cv.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&] {
-                return (ptr = attempt()) != nullptr;
-            });
-        }
+        auto cond = [&] { return (ptr = attempt()) != nullptr; };
+        if (timeout_ms < 0) m_cv.wait(lock, cond);
+        else m_cv.wait_for(lock, std::chrono::milliseconds(timeout_ms), cond);
+
         return ptr;
     }
 
     void Deallocate(void* ptr) {
         if (!ptr || !m_initialized) return;
-
         {
             std::lock_guard<std::mutex> lock(m_syncMutex);
             Header* h = reinterpret_cast<Header*>(static_cast<char*>(ptr) - sizeof(Header));
-            m_pool_res->deallocate(h, h->size, alignof(Header));
+            m_cb->pool_res.deallocate(h, h->size, alignof(Header));
         }
-        m_cv.notify_all(); // 待機中のスレッドへ通知
+        m_cv.notify_all();
     }
 
 private:
     MemoryManager() = default;
-    
+    ~MemoryManager() { Shutdown(); }
+
+    ControlBlock* m_cb = nullptr;
     bool m_initialized = false;
     std::mutex m_syncMutex;
     std::condition_variable m_cv;
-    std::pmr::monotonic_buffer_resource* m_mono_res = nullptr;
-    std::pmr::synchronized_pool_resource* m_pool_res = nullptr;
 };
 
 } // namespace Lab
