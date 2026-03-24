@@ -7,6 +7,7 @@
 #include <new>
 #include <cstdint>
 #include <array>
+#include <cassert>
 
 namespace Lab {
 
@@ -16,22 +17,24 @@ public:
         void* m_ptr;
         size_t m_size;
         size_t m_offset = 0;
+
     public:
         InternalFixedResource(void* p, size_t s) : m_ptr(p), m_size(s) {}
 
         void* do_allocate(size_t bytes, size_t alignment) override {
-            void* current = static_cast<uint8_t*>(m_ptr) + m_offset;
+            void* ptr = static_cast<uint8_t*>(m_ptr) + m_offset;
             size_t space = m_size - m_offset;
 
-            void* aligned = std::align(alignment, bytes, current, space);
+            void* aligned = std::align(alignment, bytes, ptr, space);
             if (!aligned) throw std::bad_alloc();
 
-            m_offset = (reinterpret_cast<uint8_t*>(aligned) - static_cast<uint8_t*>(m_ptr)) + bytes;
+            size_t used =
+                (static_cast<uint8_t*>(aligned) - static_cast<uint8_t*>(m_ptr)) + bytes;
+
+            m_offset = used;
             return aligned;
         }
 
-        // Monotonic resource: deallocate is a no-op.
-        // Memory is reclaimed only on Shutdown().
         void do_deallocate(void*, size_t, size_t) override {}
 
         bool do_is_equal(const memory_resource& other) const noexcept override {
@@ -39,12 +42,12 @@ public:
         }
     };
 
-    static constexpr size_t LARGE_THRESHOLD = 1024 * 1024; // 1MB
+    static constexpr size_t LARGE_THRESHOLD = 1024 * 1024;
     static constexpr size_t MAX_CACHE_BLOCKS = 8;
 
     struct CachedBlock {
         void* ptr;
-        size_t size; // total_size
+        size_t size;
     };
 
     struct alignas(std::max_align_t) ControlBlock {
@@ -58,13 +61,13 @@ public:
             : fixed_res(dataArea, dataSize),
               pool_res(&fixed_res),
               large_cache{},
-              cache_count(0)
-        {}
+              cache_count(0) {}
     };
 
     struct alignas(std::max_align_t) Header {
-        size_t total_size;   // allocator内部サイズ
-        size_t user_size;    // ユーザー要求サイズ
+        uint32_t magic;
+        size_t total_size;
+        size_t user_size;
         void* original_ptr;
     };
 
@@ -105,11 +108,8 @@ public:
         if (!m_initialized) return nullptr;
 
         constexpr size_t alignment = alignof(std::max_align_t);
-        static_assert((alignment & (alignment - 1)) == 0, "alignment must be power of two");
-
         const size_t headerSize = sizeof(Header);
 
-        // オーバーフロー対策
         if (size > SIZE_MAX - headerSize - alignment)
             return nullptr;
 
@@ -118,46 +118,68 @@ public:
         std::unique_lock<std::mutex> lock(m_syncMutex);
 
         auto attempt = [&]() -> void* {
-            // 巨大オブジェクトはキャッシュ優先
+            // ===== Large cache =====
             if (size >= LARGE_THRESHOLD) {
+                size_t best_index = SIZE_MAX;
+                size_t best_size = SIZE_MAX;
+
                 for (size_t i = 0; i < m_cb->cache_count; ++i) {
-                    if (m_cb->large_cache[i].size >= totalSize) {
-                        CachedBlock found = std::move(m_cb->large_cache[i]);
-
-                        m_cb->large_cache[i] = m_cb->large_cache[m_cb->cache_count - 1];
-                        m_cb->large_cache[m_cb->cache_count - 1] = {nullptr, 0};
-                        m_cb->cache_count--;
-
-                        uintptr_t uAddr =
-                            (reinterpret_cast<uintptr_t>(found.ptr) + headerSize + alignment - 1)
-                            & ~(alignment - 1);
-
-                        Header* h = reinterpret_cast<Header*>(uAddr - headerSize);
-                        h->total_size = found.size;
-                        h->user_size = size;
-                        h->original_ptr = found.ptr;
-
-                        return reinterpret_cast<void*>(uAddr);
+                    size_t s = m_cb->large_cache[i].size;
+                    if (s >= totalSize && s < best_size) {
+                        best_size = s;
+                        best_index = i;
                     }
+                }
+
+                if (best_index != SIZE_MAX) {
+                    CachedBlock blk = m_cb->large_cache[best_index];
+
+                    m_cb->large_cache[best_index] =
+                        m_cb->large_cache[m_cb->cache_count - 1];
+                    m_cb->cache_count--;
+
+                    uint8_t* base = static_cast<uint8_t*>(blk.ptr);
+
+                    Header* h = reinterpret_cast<Header*>(base);
+
+                    void* user_ptr = base + sizeof(Header);
+                    size_t space = blk.size - sizeof(Header);
+
+                    void* aligned = std::align(alignment, size, user_ptr, space);
+                    if (!aligned) return nullptr;
+
+                    h->magic = 0xDEADBEEF;
+                    h->total_size = blk.size;
+                    h->user_size = size;
+                    h->original_ptr = blk.ptr;
+
+                    return aligned;
                 }
             }
 
+            // ===== Pool allocate =====
             try {
                 void* raw = m_cb->pool_res.allocate(totalSize, alignment);
 
-                uintptr_t uAddr =
-                    (reinterpret_cast<uintptr_t>(raw) + headerSize + alignment - 1)
-                    & ~(alignment - 1);
+                uint8_t* base = static_cast<uint8_t*>(raw);
+                Header* h = reinterpret_cast<Header*>(base);
 
-                Header* h = reinterpret_cast<Header*>(uAddr - headerSize);
+                void* user_ptr = base + sizeof(Header);
+                size_t space = totalSize - sizeof(Header);
+
+                void* aligned = std::align(alignment, size, user_ptr, space);
+                if (!aligned) throw std::bad_alloc();
+
+                h->magic = 0xDEADBEEF;
                 h->total_size = totalSize;
                 h->user_size = size;
                 h->original_ptr = raw;
 
-                return reinterpret_cast<void*>(uAddr);
-            } catch (...) {}
+                return aligned;
 
-            return nullptr;
+            } catch (const std::bad_alloc&) {
+                return nullptr;
+            }
         };
 
         void* ptr = attempt();
@@ -179,20 +201,23 @@ public:
         {
             std::lock_guard<std::mutex> lock(m_syncMutex);
 
-            Header* h = reinterpret_cast<Header*>(
-                static_cast<uint8_t*>(ptr) - sizeof(Header));
+            uint8_t* p = static_cast<uint8_t*>(ptr);
+            Header* h = reinterpret_cast<Header*>(p - sizeof(Header));
+
+            assert(h->magic == 0xDEADBEEF);
 
             if (h->user_size >= LARGE_THRESHOLD) {
                 if (m_cb->cache_count < MAX_CACHE_BLOCKS) {
                     m_cb->large_cache[m_cb->cache_count++] =
                         {h->original_ptr, h->total_size};
+                    return;
                 }
-            } else {
-                m_cb->pool_res.deallocate(
-                    h->original_ptr,
-                    h->total_size,
-                    alignof(std::max_align_t));
             }
+
+            m_cb->pool_res.deallocate(
+                h->original_ptr,
+                h->total_size,
+                alignof(std::max_align_t));
         }
 
         m_cv.notify_all();
