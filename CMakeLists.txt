@@ -24,7 +24,7 @@ add_library(MemoryManager STATIC
 target_link_libraries(MemoryManager PRIVATE Threads::Threads)
 
 # テスト実行ファイルの定義
-add_executable(mem_test main.c)
+add_executable(mem_test main.cpp)
 
 # 実行ファイルにライブラリをリンク
 target_link_libraries(mem_test PRIVATE MemoryManager)
