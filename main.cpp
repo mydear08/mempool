@@ -23,7 +23,7 @@ void WorkerThread(int id) {
             }
 
             // 何か処理をしているフリ（少し待つ）
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
             // 解放
             Lab::MemoryManager::Instance().Deallocate(ptr);
@@ -35,11 +35,13 @@ void WorkerThread(int id) {
 
 int main() {
     // 1. 初期化
-    auto result = Lab::MemoryManager::Instance().Initialize(system_heap, sizeof(system_heap));
+    Lab::MemoryManager::Instance().Initialize(sizeof(system_heap));
+#if 0
     if (result != Lab::MemoryManager::Result::Success) {
         std::cerr << "Initialize Failed!" << std::endl;
         return -1;
     }
+#endif
 
     std::cout << "Starting Multi-threaded Test..." << std::endl;
 

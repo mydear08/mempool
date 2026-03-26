@@ -8,10 +8,7 @@ extern "C" {
 #endif
 
 // 初期化。成功なら1、失敗なら0を返すわ。
-int LabPool_Init(void* buffer, size_t size);
-
-// 終了処理。デストラクタを明示的に呼び出してリソースを解放するわ。
-void LabPool_Shutdown();
+int LabPool_Init(size_t size);
 
 // タイムアウト付き確保。timeout_ms: 0なら即時、-1なら無限待機。
 void* LabPool_MallocTimeout(size_t size, int timeout_ms);

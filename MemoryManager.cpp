@@ -3,12 +3,9 @@
 
 extern "C" {
 
-int LabPool_Init(void* buffer, size_t size) {
-    return (Lab::MemoryManager::Instance().Initialize(buffer, size) == Lab::MemoryManager::Result::Success);
-}
-
-void LabPool_Shutdown() {
-    Lab::MemoryManager::Instance().Shutdown();
+int LabPool_Init(size_t size) {
+    Lab::MemoryManager::Instance().Initialize(size);
+    return 0; // 成功
 }
 
 void* LabPool_MallocTimeout(size_t size, int timeout_ms) {

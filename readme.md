@@ -57,3 +57,43 @@ graph TD
     MM_Shutdown -- "m_shutting_down = true" --> Wait_Cond["Wait (active_ops == 0 && live_allocations == 0)"]
     Wait_Cond --> CB_Destroy["ControlBlock解体 (再初期化待機)"]
 ```
+
+```mermaid
+graph TD
+    %% 100MBの土地の状態
+    subgraph Space ["100MBの静的配列 (土地)"]
+        direction LR
+        Used(使用済み) --- Border((境界線 m_offset))
+        Border --- Virgin(未開拓の処女地)
+    end
+
+    %% 管理者の役割
+    subgraph Manager ["MemoryManager の統治"]
+        direction TB
+        Cache{{"自作キャッシュ (1MB以上の岩)"}}
+        Pool{{"PMRプール (1MB未満の小石)"}}
+    end
+
+    %% 確保のルート
+    User((ユーザー)) -- "30MB要求" --> Cache
+    Cache -- "在庫あり" --> User
+    note1["【再利用】境界線は動かない！"]
+
+    Cache -- "在庫なし" --> Border
+    Border -- "境界線を30MB進める" --> User
+    note2["【新規開拓】土地を消費"]
+
+    User -- "1KB要求" --> Pool
+    Pool -- "在庫あり" --> User
+    note3["【再利用】境界線は動かない！"]
+
+    Pool -- "在庫なし" --> Border
+    Border -- "境界線を削る" --> User
+    note4["【新規開拓】土地を消費"]
+
+    %% スタイル
+    style Border fill:#ff3333,color:#fff,stroke-width:2px
+    style Space fill:#f9f9f9,stroke:#333
+    style Cache fill:#fff0f0,stroke:#ffcccc
+    style Pool fill:#f0fff0,stroke:#ccffcc
+```
