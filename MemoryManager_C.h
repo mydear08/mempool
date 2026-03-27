@@ -8,6 +8,7 @@ extern "C" {
 #endif
 
 // 初期化。成功なら1、失敗なら0を返すわ。
+//int LabPool_Init(void* buffer, size_t size);
 int LabPool_Init(size_t size);
 
 // タイムアウト付き確保。timeout_ms: 0なら即時、-1なら無限待機。

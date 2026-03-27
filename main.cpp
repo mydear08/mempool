@@ -1,17 +1,19 @@
 #include "MemoryManager.hpp" // あなたのクラス名に合わせてね
+#include "MemoryManager_C.h"
 #include <iostream>
 #include <thread>
 #include <vector>
 #include <iomanip>
 
 // 100MBの静的バッファ
+alignas(std::max_align_t)
 static uint8_t system_heap[100 * 1024 * 1024] __attribute__((aligned(16)));
 
 void WorkerThread(int id) {
     for (int i = 0; i < 5; ++i) {
         // 30MBを確保
-        size_t allocSize = 1024 * 1024 * 30;
-        void* ptr = Lab::MemoryManager::Instance().Allocate(allocSize, 500); // 500ms待機
+        size_t allocSize = 1024 * 1024 * 10 * i;
+        void* ptr = lab::MemoryManager::Instance().Allocate(allocSize, 500); // 500ms待機
 
         if (ptr) {
             {
@@ -26,7 +28,7 @@ void WorkerThread(int id) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
             // 解放
-            Lab::MemoryManager::Instance().Deallocate(ptr);
+            lab::MemoryManager::Instance().Deallocate(ptr);
         } else {
             std::cerr << "[Thread " << id << "] Allocation FAILED!" << std::endl;
         }
@@ -35,9 +37,9 @@ void WorkerThread(int id) {
 
 int main() {
     // 1. 初期化
-    Lab::MemoryManager::Instance().Initialize(sizeof(system_heap));
+    lab::MemoryManager::Instance().Initialize(sizeof(system_heap));
 #if 0
-    if (result != Lab::MemoryManager::Result::Success) {
+    if (result != lab::MemoryManager::Result::Success) {
         std::cerr << "Initialize Failed!" << std::endl;
         return -1;
     }

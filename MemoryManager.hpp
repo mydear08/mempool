@@ -1,128 +1,178 @@
 #pragma once
-#include <memory_resource>
-#include <mutex>
-#include <condition_variable>
-#include <cstddef>
-#include <chrono>
-#include <cstdint>
-#include <optional>
-#include <algorithm>
 
-namespace Lab {
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <condition_variable>
+#include <chrono>
+#include <iostream>
+#include <mutex>
+#include <new>
+#include <sys/resource.h>
+
+namespace lab {
 
 class MemoryManager {
-public:
-    static MemoryManager& Instance() {
-        static MemoryManager instance;
-        return instance;
+ public:
+  // -------------------------------
+  // シングルトン取得
+  // -------------------------------
+  static MemoryManager& Instance() {
+    static MemoryManager instance;
+    return instance;
+  }
+
+  // コピー・ムーブ禁止
+  MemoryManager(const MemoryManager&) = delete;
+  MemoryManager& operator=(const MemoryManager&) = delete;
+  MemoryManager(MemoryManager&&) = delete;
+  MemoryManager& operator=(MemoryManager&&) = delete;
+
+  // -------------------------------
+  // プロセスメモリ上限（任意）
+  // -------------------------------
+  bool SetProcessLimit(size_t bytes) {
+    struct rlimit rl;
+    rl.rlim_cur = bytes;
+    rl.rlim_max = bytes;
+
+    if (setrlimit(RLIMIT_AS, &rl) != 0) {
+      perror("setrlimit failed");
+      return false;
     }
+    return true;
+  }
 
-    MemoryManager() : m_capacity(0), m_used(0) {}
+  // -------------------------------
+  // 初期化（論理上限）
+  // -------------------------------
+  void Initialize(size_t max_bytes) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    limit_ = max_bytes;
+    used_.store(0, std::memory_order_relaxed);
+  }
 
-    /**
-     * @brief 聖域の構築
-     * @param capacity 確保したい合計サイズ。これを一括チャンクとしてOSから取得します。
-     */
-    void Initialize(size_t capacity) {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        
-        m_capacity = capacity;
-        m_used = 0;
+  // -------------------------------
+  // Allocate
+  // -------------------------------
+  void* Allocate(size_t size,
+                 int timeout_ms = -1,
+                 size_t alignment = alignof(std::max_align_t)) {
+    if (size == 0) size = 1;
 
-        // 閣下の戦略：指定サイズを一気にチャンクとして要求するオプション
-        std::pmr::pool_options opts;
-        opts.max_blocks_per_chunk = m_capacity; 
-        opts.largest_required_pool_block = 0;   // プールの最適化アルゴリズムに委ねます
+    const size_t header_size = AlignUp(sizeof(Header), alignment);
+    const size_t total = header_size + size;
 
-        // 既存のプールを破棄し、新しい「100MB級チャンク設定」で再生成
-        // これにより、使い終わった古いメモリはOSへ返却され、新しい聖域が築かれます
-        m_pool.emplace(opts, std::pmr::new_delete_resource());
-    }
+    std::unique_lock<std::mutex> lock(mutex_);
 
-    void* Allocate(size_t size, int timeout_ms = -1) {
-        if (!m_pool) return nullptr;
-
-        // アライメントの定義（i.MX 8 等の 64bit 環境では通常 16バイト）
-        constexpr size_t alignment = alignof(std::max_align_t);
-        
-        // 【修正点】ヘッダとデータの合計を、アライメント境界へ切り上げ
-        // 次に Allocate されるブロックの開始位置がズレないための絶対防衛線です
-        const size_t total = (size + sizeof(Header) + alignment - 1) & ~(alignment - 1);
-
-        std::unique_lock<std::mutex> lock(m_mutex);
-
-        auto can_alloc = [&] { return m_used + total <= m_capacity; };
-
-        if (!can_alloc()) {
-            if (timeout_ms == 0) return nullptr;
-            if (timeout_ms < 0) {
-                m_cv.wait(lock, can_alloc);
-            } else {
-                if (!m_cv.wait_for(lock, std::chrono::milliseconds(timeout_ms), can_alloc)) {
-                    return nullptr;
-                }
-            }
-        }
-
-        void* raw = nullptr;
-        try {
-            // 一括確保されたチャンクの中から、アラインされたサイズで切り出し
-            raw = m_pool->allocate(total, alignment);
-        } catch (...) {
-            return nullptr;
-        }
-
-        if (!raw) return nullptr;
-
-        Header* h = static_cast<Header*>(raw);
-        h->size = total;
-        h->magic = MAGIC_NUMBER;
-        m_used += total;
-
-        // ユーザーにはヘッダの直後のアドレスを渡します
-        return static_cast<char*>(raw) + sizeof(Header);
-    }
-
-    void Deallocate(void* ptr) {
-        if (!ptr || !m_pool) return;
-
-        Header* h = reinterpret_cast<Header*>(static_cast<char*>(ptr) - sizeof(Header));
-
-        std::lock_guard<std::mutex> lock(m_mutex);
-
-        if (h->magic != MAGIC_NUMBER) return;
-
-        h->magic = 0; // 解放済みマーク
-        const size_t size = h->size;
-
-        // プールの「懐（フリーリスト）」へ返却。
-        // これで 100MB の内側で、サイズ不定でも効率よく再利用されます
-        m_pool->deallocate(h, size, alignof(std::max_align_t));
-        m_used -= size;
-
-        m_cv.notify_all();
-    }
-
-    size_t GetUsed() const { return m_used; }
-    size_t GetCapacity() const { return m_capacity; }
-
-private:
-    // ヘッダ自体もアライメント境界に配置されるよう強制します
-    struct alignas(std::max_align_t) Header {
-        size_t size;
-        uint32_t magic;
+    auto can_allocate = [&]() {
+      return used_.load(std::memory_order_relaxed) + total <= limit_;
     };
-    static constexpr uint32_t MAGIC_NUMBER = 0xDEADC0DE;
 
-    std::optional<std::pmr::unsynchronized_pool_resource> m_pool;
-    
-    size_t m_capacity;
-    size_t m_used;
-    std::mutex m_mutex;
-    std::condition_variable m_cv;
+    if (!can_allocate()) {
+      if (timeout_ms == 0) return nullptr;
 
-    MemoryManager(const MemoryManager&) = delete;
-    MemoryManager& operator=(const MemoryManager&) = delete;
+      if (timeout_ms < 0) {
+        cv_.wait(lock, can_allocate);
+      } else {
+        if (!cv_.wait_for(lock,
+                          std::chrono::milliseconds(timeout_ms),
+                          can_allocate)) {
+          return nullptr;
+        }
+      }
+    }
+
+    void* raw = AllocateRaw(total, alignment);
+    if (!raw) {
+      HandleOOM(total);
+      return nullptr;
+    }
+
+    auto* header = reinterpret_cast<Header*>(raw);
+    header->size = total;
+
+    used_.fetch_add(total, std::memory_order_relaxed);
+
+    return reinterpret_cast<std::byte*>(raw) + header_size;
+  }
+
+  // -------------------------------
+  // Deallocate
+  // -------------------------------
+  void Deallocate(void* ptr) {
+    if (!ptr) return;
+
+    const size_t alignment = alignof(std::max_align_t);
+    const size_t header_size = AlignUp(sizeof(Header), alignment);
+
+    auto* raw = reinterpret_cast<std::byte*>(ptr) - header_size;
+    auto* header = reinterpret_cast<Header*>(raw);
+
+    const size_t total = header->size;
+
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      used_.fetch_sub(total, std::memory_order_relaxed);
+    }
+
+    std::free(raw);
+    cv_.notify_one();
+  }
+
+  size_t GetUsed() const {
+    return used_.load(std::memory_order_relaxed);
+  }
+
+  size_t GetLimit() const {
+    return limit_;
+  }
+
+ private:
+  MemoryManager() = default;
+
+  struct Header {
+    size_t size;
+  };
+
+  static size_t AlignUp(size_t value, size_t alignment) {
+    return (value + alignment - 1) & ~(alignment - 1);
+  }
+
+  static void* AllocateRaw(size_t size, size_t alignment) {
+    if (alignment <= alignof(std::max_align_t)) {
+      return std::malloc(size);
+    }
+
+#if (__cplusplus >= 201703L)
+    size_t aligned_size = AlignUp(size, alignment);
+    return std::aligned_alloc(alignment, aligned_size);
+#else
+    void* ptr = nullptr;
+    if (posix_memalign(&ptr, alignment, size) != 0) {
+      return nullptr;
+    }
+    return ptr;
+#endif
+  }
+
+  static void HandleOOM(size_t size) {
+    std::lock_guard<std::mutex> lock(GetLogMutex());
+    std::cerr << "[OOM] Allocation failed: " << size << " bytes\n";
+  }
+
+  static std::mutex& GetLogMutex() {
+    static std::mutex m;
+    return m;
+  }
+
+ private:
+  std::atomic<size_t> used_{0};
+  size_t limit_ = 0;
+
+  mutable std::mutex mutex_;
+  std::condition_variable cv_;
 };
 
-} // namespace Lab
+}  // namespace lab
